@@ -454,7 +454,7 @@ class PyPI:
                 else:
                     file_tags += ' data-yanked=""'
 
-            # PEP 658: data-dist-info-metadata attribute
+            # PEP 714: data-core-metadata attribute (renamed from data-dist-info-metadata)
             if package_simple_path is not None:
                 local_path = cls.file_url_to_local_path(release["url"])
                 metadata_path = get_metadata_path(
@@ -465,9 +465,7 @@ class PyPI:
                         with open(metadata_path, "rb") as f:
                             metadata_content = f.read()
                         metadata_hash = compute_metadata_hash(metadata_content)
-                        file_tags += (
-                            f' data-dist-info-metadata="sha256={metadata_hash}"'
-                        )
+                        file_tags += f' data-core-metadata="sha256={metadata_hash}"'
                     except (IOError, OSError):
                         pass  # Skip if unable to read metadata file
 
