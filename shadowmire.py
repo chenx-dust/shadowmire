@@ -12,6 +12,7 @@ from pathlib import Path
 from html.parser import HTMLParser
 import logging
 import html
+import hashlib
 import os
 from os.path import (
     normpath,
@@ -324,6 +325,31 @@ def create_requests_session() -> requests.Session:
     return s
 
 
+def compute_metadata_hash(content: bytes) -> str:
+    """
+    Compute SHA-256 hash of metadata content and return in format: sha256=<hex>
+    """
+    return hashlib.sha256(content).hexdigest()
+
+
+def get_metadata_url(file_url: str) -> str:
+    """
+    Get metadata URL from distribution file URL.
+    For example: https://files.pythonhosted.org/.../package.whl
+    Returns: https://files.pythonhosted.org/.../package.whl.metadata
+    """
+    return file_url + ".metadata"
+
+
+def get_metadata_path(file_path: Path) -> Path:
+    """
+    Get metadata file path from distribution file path.
+    For example: packages/ab/cd/ef/package.whl
+    Returns: packages/ab/cd/ef/package.whl.metadata
+    """
+    return Path(str(file_path) + ".metadata")
+
+
 class PyPI:
     """
     Upstream which implements full PyPI APIs
@@ -393,7 +419,9 @@ class PyPI:
 
     # Func modified from bandersnatch
     @classmethod
-    def generate_html_simple_page(cls, package_meta: dict) -> str:
+    def generate_html_simple_page(
+        cls, package_meta: dict, package_simple_path: Optional[Path] = None
+    ) -> str:
         package_rawname = package_meta["info"]["name"]
         simple_page_content = (
             "<!DOCTYPE html>\n"
@@ -426,6 +454,23 @@ class PyPI:
                 else:
                     file_tags += ' data-yanked=""'
 
+            # PEP 658: data-dist-info-metadata attribute
+            if package_simple_path is not None:
+                local_path = cls.file_url_to_local_path(release["url"])
+                metadata_path = get_metadata_path(
+                    Path(normpath(package_simple_path / local_path))
+                )
+                if metadata_path.exists():
+                    try:
+                        with open(metadata_path, "rb") as f:
+                            metadata_content = f.read()
+                        metadata_hash = compute_metadata_hash(metadata_content)
+                        file_tags += (
+                            f' data-dist-info-metadata="sha256={metadata_hash}"'
+                        )
+                    except (IOError, OSError):
+                        pass  # Skip if unable to read metadata file
+
             return file_tags
 
         simple_page_content += "\n".join(
@@ -449,7 +494,9 @@ class PyPI:
 
     # Func modified from bandersnatch
     @classmethod
-    def generate_json_simple_page(cls, package_meta: dict) -> str:
+    def generate_json_simple_page(
+        cls, package_meta: dict, package_simple_path: Optional[Path] = None
+    ) -> str:
         package_json: dict[str, Any] = {
             "files": [],
             "meta": {
@@ -466,19 +513,35 @@ class PyPI:
 
         # Add release files into the JSON dict
         for r in release_files:
-            package_json["files"].append(
-                {
-                    "filename": r["filename"],
-                    "hashes": {
-                        cls.digest_name: r["digests"][cls.digest_name],
-                    },
-                    "requires-python": r.get("requires_python", ""),
-                    "size": r["size"],
-                    "upload-time": r.get("upload_time_iso_8601", ""),
-                    "url": cls.file_url_to_local_url(r["url"]),
-                    "yanked": r.get("yanked", False),
-                }
-            )
+            file_entry: dict[str, Any] = {
+                "filename": r["filename"],
+                "hashes": {
+                    cls.digest_name: r["digests"][cls.digest_name],
+                },
+                "requires-python": r.get("requires_python", ""),
+                "size": r["size"],
+                "upload-time": r.get("upload_time_iso_8601", ""),
+                "url": cls.file_url_to_local_url(r["url"]),
+                "yanked": r.get("yanked", False),
+            }
+
+            # PEP 658/691: data-core-metadata field (used in JSON API) or core-metadata field
+            if package_simple_path is not None:
+                local_path = cls.file_url_to_local_path(r["url"])
+                metadata_path = get_metadata_path(
+                    Path(normpath(package_simple_path / local_path))
+                )
+                if metadata_path.exists():
+                    try:
+                        with open(metadata_path, "rb") as f:
+                            metadata_content = f.read()
+                        metadata_hash = compute_metadata_hash(metadata_content)
+                        # Per PEP 691, use "core-metadata" with hash dict
+                        file_entry["core-metadata"] = {cls.digest_name: metadata_hash}
+                    except (IOError, OSError):
+                        pass  # Skip if unable to read metadata file
+
+            package_json["files"].append(file_entry)
 
         return json.dumps(package_json)
 
@@ -925,8 +988,8 @@ class SyncBase:
         raise NotImplementedError
 
     def write_meta_to_simple(self, package_simple_path: Path, meta: dict) -> None:
-        simple_html_contents = PyPI.generate_html_simple_page(meta)
-        simple_json_contents = PyPI.generate_json_simple_page(meta)
+        simple_html_contents = PyPI.generate_html_simple_page(meta, package_simple_path)
+        simple_json_contents = PyPI.generate_json_simple_page(meta, package_simple_path)
         for html_filename in ("index.v1_html",):
             html_path = package_simple_path / html_filename
             with overwrite(html_path) as f:
@@ -1107,6 +1170,9 @@ class SyncPyPI(SyncBase):
                 logger.info("removing file %s (if exists)", p)
                 package_path = Path(normpath(package_simple_path / p))
                 package_path.unlink(missing_ok=True)
+                # Also remove associated metadata file
+                metadata_path = get_metadata_path(package_path)
+                metadata_path.unlink(missing_ok=True)
             for i in release_files:
                 url = i["url"]
                 dest = Path(
@@ -1123,6 +1189,26 @@ class SyncPyPI(SyncBase):
                 if not success:
                     logger.warning("skipping %s as it fails downloading", package_name)
                     return None
+
+                # PEP 658: Download metadata file if available
+                metadata_url = get_metadata_url(url)
+                metadata_dest = get_metadata_path(dest)
+                logger.debug(
+                    "attempting to download metadata %s -> %s",
+                    metadata_url,
+                    metadata_dest,
+                )
+                metadata_success, metadata_resp = download(
+                    self.session, metadata_url, metadata_dest
+                )
+                if not metadata_success:
+                    # Metadata files are optional, so we don't fail if they're not available
+                    if metadata_resp and metadata_resp.status_code == 404:
+                        logger.debug("metadata file not available for %s", url)
+                    else:
+                        logger.debug("failed to download metadata for %s", url)
+                    # Remove partially downloaded metadata file if it exists
+                    metadata_dest.unlink(missing_ok=True)
 
         last_serial: int = meta["last_serial"]
 
@@ -1228,6 +1314,9 @@ class SyncPlainHTTP(SyncBase):
                 logger.info("removing file %s (if exists)", p)
                 package_path = Path(normpath(package_simple_path / p))
                 package_path.unlink(missing_ok=True)
+                # Also remove associated metadata file
+                metadata_path = get_metadata_path(package_path)
+                metadata_path.unlink(missing_ok=True)
             package_simple_url = urljoin(self.upstream, f"simple/{package_name}/")
             for i in release_files:
                 href = PyPI.file_url_to_local_url(i["url"])
@@ -1258,6 +1347,37 @@ class SyncPlainHTTP(SyncBase):
                             "skipping %s as it fails downloading", package_name
                         )
                         return None
+
+                # PEP 658: Download metadata file if available
+                # Try from upstream first, then fallback to PyPI if needed
+                metadata_href = href + ".metadata"
+                metadata_url = urljoin(package_simple_url, metadata_href)
+                metadata_dest = get_metadata_path(dest)
+                logger.debug(
+                    "attempting to download metadata %s -> %s",
+                    metadata_url,
+                    metadata_dest,
+                )
+                metadata_success, metadata_resp = download(
+                    self.session, metadata_url, metadata_dest
+                )
+                if not metadata_success:
+                    if metadata_resp and metadata_resp.status_code == 404:
+                        # Try PyPI fallback
+                        pypi_metadata_url = get_metadata_url(i["url"])
+                        logger.debug(
+                            "metadata not at upstream, trying PyPI: %s",
+                            pypi_metadata_url,
+                        )
+                        metadata_success, metadata_resp = download(
+                            self.session, pypi_metadata_url, metadata_dest
+                        )
+                        if not metadata_success:
+                            logger.debug("metadata file not available for %s", i["url"])
+                            metadata_dest.unlink(missing_ok=True)
+                    else:
+                        logger.debug("failed to download metadata for %s", url)
+                        metadata_dest.unlink(missing_ok=True)
 
         # OK, now it's safe to rename
         (self.jsonmeta_dir / (package_name + ".new")).rename(
@@ -1662,6 +1782,12 @@ def verify(
                 np = normpath(sd / i)
                 logger.debug("add to ref_set: %s", np)
                 nps.append(np)
+                # Also add metadata file to reference set if it exists
+                metadata_np = normpath(sd / i) + ".metadata"
+                metadata_path = Path(metadata_np)
+                if metadata_path.exists():
+                    logger.debug("add to ref_set: %s", metadata_np)
+                    nps.append(metadata_np)
             return nps
 
         # MyPy does not enjoy same variable name with different types, even when --allow-redefinition
