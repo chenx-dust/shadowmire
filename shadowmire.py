@@ -971,6 +971,11 @@ class SyncBase:
                 if p.exists():
                     p.unlink()
                     logger.info("Removed file %s", p)
+                # Also remove associated metadata file
+                metadata_p = get_metadata_path(p)
+                if metadata_p.exists():
+                    metadata_p.unlink()
+                    logger.info("Removed metadata file %s", metadata_p)
         remove_dir_with_files(package_simple_dir)
         metajson_path = self.jsonmeta_dir / package_name
         metajson_path.unlink(missing_ok=True)
