@@ -327,7 +327,7 @@ def create_requests_session() -> requests.Session:
 
 def compute_metadata_hash(content: bytes) -> str:
     """
-    Compute SHA-256 hash of metadata content and return in format: sha256=<hex>
+    Compute SHA-256 hash of metadata content and return as hex digest string.
     """
     return hashlib.sha256(content).hexdigest()
 
@@ -525,7 +525,7 @@ class PyPI:
                 "yanked": r.get("yanked", False),
             }
 
-            # PEP 658/691: data-core-metadata field (used in JSON API) or core-metadata field
+            # PEP 658/691: core-metadata field for JSON API
             if package_simple_path is not None:
                 local_path = cls.file_url_to_local_path(r["url"])
                 metadata_path = get_metadata_path(
@@ -1788,9 +1788,9 @@ def verify(
                 logger.debug("add to ref_set: %s", np)
                 nps.append(np)
                 # Also add metadata file to reference set if it exists
-                metadata_np = normpath(sd / i) + ".metadata"
-                metadata_path = Path(metadata_np)
+                metadata_path = get_metadata_path(Path(np))
                 if metadata_path.exists():
+                    metadata_np = str(metadata_path)
                     logger.debug("add to ref_set: %s", metadata_np)
                     nps.append(metadata_np)
             return nps
